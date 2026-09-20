@@ -1,121 +1,129 @@
-# Wikipedia GDP Pipeline
+# Web Table to Warehouse — ETL Pipeline
 
-An ETL pipeline that extracts country GDP figures from Wikipedia, converts them
-from millions to billions of USD, and loads the result into both a CSV file and
-a SQLite database.
+A parameterised ETL pipeline that scrapes a table from a website, converts its values into a chosen
+currency, and publishes the result to a lakehouse and a Postgres database — orchestrated as a
+three-task workflow on Azure Databricks.
 
-The source table carries three independent estimates for each country — IMF,
-World Bank, and United Nations — and all three are preserved through the
-pipeline.
+The source page, target table, currency and destinations are all job parameters, so the same code
+runs against a different source without edits. It currently runs against a Wikipedia GDP-by-country
+table.
+
+> Inspired by a project from the IBM Data Engineering Professional Certificate. The original was a
+> local script writing to a CSV file and SQLite. This version was rebuilt for the cloud:
+> parameterised, orchestrated, idempotent, and secured with managed identity instead of hardcoded
+> paths and keys.
 
 ---
 
-## Output
+## Architecture
 
-The pipeline produces `GDP_data.csv` and a `Countries_by_GDP` table in
-`GDP_data.db`. First five rows:
+```mermaid
+flowchart LR
+    W[Data source: website<br/>e.g. GDP by country table] --> E
 
-| Country | IMF_USD_bn | World_Bank_USD_bn | UN_USD_bn |
-|---|---|---|---|
-| United States | 32383.92 | 30769.70 | 29298.00 |
-| China | 20851.59 | 19498.04 | 18743.80 |
-| Germany | 5452.86 | 5050.92 | 4659.93 |
-| Japan | 4379.25 | 4435.16 | 4026.21 |
-| United Kingdom | 4264.79 | 4002.59 | 3685.88 |
+    subgraph JOB["Databricks Job"]
+        E[1 · extract] --> T[2 · transform] --> L[3 · load]
+    end
 
-221 rows total, covering IMF members alongside non-sovereign territories and
-states with limited recognition.
+    subgraph LAKE["ADLS Gen2 + Unity Catalog"]
+        B[(bronze<br/>raw HTML + logs)]
+        S[(silver<br/>cleaned table<br/>e.g. countries_gdp)]
+        G[(gold<br/>current snapshot + CSV export)]
+    end
 
-Every stage writes to `etl_project_log.txt`:
+    R[/Rate conversion file<br/>exchange_rate.csv/] --> T
+    E --> B
+    B --> T
+    T --> S
+    S --> L
+    L --> G
+    L --> N[(Database<br/>e.g. Neon Postgres)]
+```
+
+Tasks hand off through storage rather than memory, so each stage can be re-run on its own — a parsing
+fix can be replayed against a saved page without scraping again.
+
+| Task | Does | Writes to |
+|---|---|---|
+| **extract** | Fetches the page. Nothing is parsed here. | Bronze: `page_<run_date>.html` |
+| **transform** | Finds the table by column keywords, parses values and years, applies the exchange rate | Silver: one snapshot per run date |
+| **load** | Publishes the current snapshot | Gold table + CSV export, and the database |
+
+---
+
+## Tech stack
+
+Azure Databricks (Serverless) · Unity Catalog · ADLS Gen2 · Delta Lake · Databricks Jobs ·
+Neon Serverless Postgres · Python (`requests`, `BeautifulSoup`, `pandas`, `PySpark`, `SQLAlchemy`)
+
+---
+
+## Repository structure
 
 ```
-2026-09-02 20:14:07 : Preliminaries complete. Initiating ETL process
-2026-09-02 20:14:09 : Page fetched and parsed
-2026-09-02 20:14:09 : Target table identified
-2026-09-02 20:14:09 : Data extraction complete (221 rows). Initiating Transformation process
-2026-09-02 20:14:09 : Data transformation complete. Initiating loading process
+├── src/
+│   ├── 01_extract.py      # website  -> bronze
+│   ├── 02_transform.py    # bronze   -> silver
+│   └── 03_load.py         # silver   -> gold + database
+├── notebooks/
+│   └── 01_explore_table.py   # profiling work that shaped the parsing logic
+└── README.md
 ```
+
+Files are in Databricks notebook source format: valid `.py` for version control, importable as
+notebooks for interactive work.
+
+---
+
+## Configuration
+
+Job parameters, shown with this project's defaults:
+
+| Parameter | Example | Purpose |
+|---|---|---|
+| `source_url` | Wikipedia GDP (nominal) | Page to scrape |
+| `table_keywords` | `Country,IMF,World Bank` | Identifies the target table by its header |
+| `target_currency` | `USD` | Looked up in the rate conversion file; USD skips conversion |
+| `value_scale` | `0.001` | Source units to output units (millions → billions) |
+| `run_date` | `{{job.start_time.iso_date}}` | Shared by all tasks so the handoff stays aligned |
+| `catalog`, `silver_table`, `gold_table`, `pg_table` | `gdp_etl_catalog`, `countries_gdp`, … | Destinations |
+| `allow_schema_change` | `false` | Guard against rebuilding a table when columns change |
+
+The rate used is stored on every row, so each snapshot records how it was produced.
+
+---
+
+## Design decisions
+
+* **No credentials in code** — storage is reached through a managed identity with least-privilege access, and the database password lives in a Unity Catalog secret.
+* **Idempotent** — re-running a date replaces it instead of duplicating it, which matters because scheduled jobs get retried.
+* **History, not overwrite** — silver keeps one timestamped snapshot per run date, so estimate revisions can be tracked over time.
+* **Source-agnostic parsing** — the table is found by column keywords and the schema is built from the page's own header; a mismatch with the existing table stops the run with a clear message.
+
+---
+
+## What the exploration found
+
+Profiling the source table before rewriting the parser exposed a silent bug: some cells carry their
+own estimate year (a value followed by `(2025)` where the header says 2026). Coercing those to
+numbers turned them into `NaN`, so dozens of values were **dropped without any error**.
+
+The parser now splits each cell into a value and a year, so those rows are retained and correctly
+dated.
 
 ---
 
 ## Running it
 
-```bash
-git clone https://github.com/murltre/wikipedia-gdp-pipeline.git
-cd wikipedia-gdp-pipeline
-pip install -r requirements.txt
-python gdp_pipeline.py
-```
-
-Outputs are written next to the script. No configuration needed.
+Needs a Databricks workspace with Unity Catalog, an ADLS Gen2 account, and a Postgres database.
+Create the catalog and medallion schemas, grant the Access Connector access to storage, upload the
+rate conversion file, store the database password as a secret, then chain the three files as
+`extract → transform → load` in a job with the parameters above.
 
 ---
 
-## How it works
+## Possible extensions
 
-| Stage | Function | What it does |
-|---|---|---|
-| Fetch | `fetch_page()` | Requests the page, raises on a non-200 response |
-| Locate | `find_target_table()` | Finds the correct table by caption text |
-| Extract | `extract()` | Parses rows into a DataFrame of raw strings |
-| Transform | `transform()` | Cleans values, converts to billions, sorts |
-| Load | `load_to_csv()`, `load_to_db()` | Writes to CSV and SQLite |
-| Verify | `run_query()` | Reads back from the database to confirm the load |
-
-Logging runs alongside every stage rather than inside the functions, so the
-functions stay independently testable.
-
----
-
-## Design notes
-
-Four decisions where the obvious approach turned out to be wrong.
-
-**Tables are located by caption, not by position.**
-The page contains two `wikitable` elements: one listing individual countries
-and one listing regional aggregates such as the EU and ASEAN. Selecting by
-index would silently pull the wrong table if Wikipedia ever reorders the page,
-and the resulting data would look plausible while being wrong. Matching on the
-caption text `by country` targets meaning rather than layout.
-
-**Requests must identify themselves.**
-Wikipedia returns `403 Forbidden` to clients using the default
-`python-requests` user-agent. The pipeline sends a descriptive `User-Agent`
-header with contact details, which is what Wikipedia's automated-access policy
-asks for. The status code is checked before parsing — without that check, an
-error page flows silently into BeautifulSoup and the pipeline produces zero
-rows instead of failing.
-
-**Missing values become `NaN` rather than dropping the row.**
-Some entries have no estimate from every source. Montserrat, for example, has
-no IMF or World Bank figure but does have a UN one. Dropping incomplete rows
-would discard real data, so `pd.to_numeric(..., errors='coerce')` converts
-unparseable entries to `NaN` and the row survives with whatever data it has.
-
-**Country names come from link text, not cell text.**
-Several cells carry footnote markers inside them — the cell for China reads
-`China[n 1]`. Reading the `<a>` element instead of the full cell returns the
-clean name. The `World` total row is excluded by the same mechanism: it is the
-only row whose first cell contains no link.
-
----
-
-## Known limitations
-
-- **The source is a scraped rendering, not the origin.** Wikipedia reproduces
-  figures published by the IMF, World Bank, and UN. Reading those sources
-  directly would be more robust; Wikipedia is used here because the table
-  consolidates all three.
-- **Estimate years are dropped.** The source headers carry the year for each
-  estimate (`IMF (2026)`), but the output columns do not. Re-running after a
-  Wikipedia update would produce different figures under identical column
-  names, with nothing to distinguish them.
-- **Each run replaces the previous output.** The table is written with
-  `if_exists='replace'`, so no history accumulates. Storing an `as_of` date and
-  appending would make the data a time series.
-
----
-
-## Built with
-
-Python · requests · BeautifulSoup · pandas · SQLite
+* Pull exchange rates from an FX API instead of a static file
+* A gold view comparing sources across snapshots to track revisions
+* Unit tests for the parser using a saved HTML fixture, so tests never touch the network
